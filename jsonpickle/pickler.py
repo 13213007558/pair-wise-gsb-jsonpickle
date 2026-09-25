@@ -8,6 +8,7 @@ import inspect
 import itertools
 import sys
 import types
+import weakref
 import warnings
 from collections.abc import Callable, Iterable, Sequence
 from itertools import chain
@@ -203,6 +204,10 @@ class Pickler:
         self._seen = []
         # A cache of objects that have already been flattened.
         self._flattened = {}
+        # Live weakref placeholders awaiting end-of-encode target resolution.
+        # Entries are (data_dict, id(target), target); the strong reference to
+        # the target prevents id() reuse while encoding is in progress.
+        self._pending_weakrefs = []
         # Used for util._is_readonly, see +483
         self.handle_readonly = handle_readonly
         # Custom context passed through to custom handlers, see #452
@@ -253,6 +258,7 @@ class Pickler:
         self._depth = -1
         self._seen = []
         self._flattened = {}
+        self._pending_weakrefs = []
 
     def _push(self) -> None:
         """Steps down one level in the namespace."""
@@ -264,8 +270,25 @@ class Pickler:
         """
         self._depth -= 1
         if self._depth == -1:
+            self._resolve_weakrefs()
             self.reset()
         return value
+
+    def _resolve_weakrefs(self) -> None:
+        """Point serialized weakrefs at targets that made it into the snapshot.
+
+        A weak edge alone never pulls its target into the snapshot, so the
+        placeholder is only rewritten to a "py/id" reference when the target
+        was also flattened through a strong edge.  Otherwise the weakref is
+        encoded as dead.
+        """
+        if not self._pending_weakrefs:
+            return
+        for data, target_id, _target in self._pending_weakrefs:
+            ref_id = self._objs.get(target_id)
+            if ref_id is not None:
+                data[tags.WEAKREF] = {tags.ID: ref_id}
+        self._pending_weakrefs = []
 
     def _log_ref(self, obj: Any) -> bool:
         """
@@ -414,6 +437,26 @@ class Pickler:
         else:
             data = None
 
+        return data
+
+    def _flatten_weakref(self, obj: "weakref.ReferenceType[Any]") -> dict[str, Any]:
+        """Flatten a weakref.ref into a py/weakref dict.
+
+        The target is recorded but not flattened here: a weak edge must not
+        pull its target into the snapshot.  _resolve_weakrefs() rewrites the
+        placeholder once encoding is complete.
+        """
+        target = obj()
+        if target is not None and weakref.ref(target) is not obj:
+            # CPython hands out a single cached weakref per (object, no
+            # callback) pair, so a live ref that is not the cached one must
+            # carry a callback.  Refuse rather than silently dropping it.
+            raise ValueError(
+                "jsonpickle cannot pickle weakref.ref objects with callbacks"
+            )
+        data: dict[str, Any] = {tags.WEAKREF: None}
+        if target is not None and self.unpicklable and self.make_refs:
+            self._pending_weakrefs.append((data, id(target), target))
         return data
 
     def _getstate(self, obj: Any, data: dict[str, Any]) -> dict[str, Any]:
@@ -904,6 +947,11 @@ class Pickler:
                     self._flatten(v) for v in obj
                 ]
             }
+
+        elif type(obj) is weakref.ReferenceType:
+            if self._mkref(obj):
+                return self._flatten_weakref
+            return self._getref
 
         elif util._is_module_function(obj):
             return self._flatten_function

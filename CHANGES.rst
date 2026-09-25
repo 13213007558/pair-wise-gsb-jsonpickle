@@ -1,5 +1,10 @@
 v5.0.0
 ======
+    * Added round-trip support for ``weakref.ref`` objects.  Live weak
+      references are restored pointing at the decoded target when the target
+      is also retained by a strong reference in the snapshot; weak references
+      whose referent was already dead (or is not strongly reachable) restore
+      as dead.  Weak references with callbacks are rejected.
     * **Breaking Change**: The ``yaml`` module is no longer registered by default.
       You can re-enable yaml support using ``jsonpickle.ext.yaml.register()``.
       (#550) (+551)

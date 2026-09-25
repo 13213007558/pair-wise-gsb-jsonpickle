@@ -31,6 +31,7 @@ SET: str = "py/set"
 STATE: str = "py/state"
 TUPLE: str = "py/tuple"
 TYPE: str = "py/type"
+WEAKREF: str = "py/weakref"
 
 # All reserved tag names
 RESERVED: set[str] = {
@@ -55,4 +56,5 @@ RESERVED: set[str] = {
     STATE,
     TUPLE,
     TYPE,
+    WEAKREF,
 }

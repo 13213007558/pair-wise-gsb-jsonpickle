@@ -6,6 +6,7 @@
 # you should have received as part of this distribution.
 import dataclasses
 import warnings
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any, TypeAlias
 
@@ -236,6 +237,15 @@ class _trivialclassic:
     """
 
 
+class _DeadWeakrefTarget:
+    """Helper class whose throwaway instances produce expired weakrefs"""
+
+
+def _make_dead_weakref() -> "weakref.ReferenceType[Any]":
+    """Return a fresh weakref whose referent has already been collected"""
+    return weakref.ref(_DeadWeakrefTarget())
+
+
 def make_blank_classic(cls: type) -> Any:
     """
     Implement the mandated strategy for dealing with classic classes
@@ -341,6 +351,8 @@ class Unpickler:
         self._obj_to_idx = {}
         self._objs = []
         self._proxies = []
+        # Weakrefs whose targets have not been restored yet
+        self._weakref_proxies = []
 
         # Extra local classes not accessible globally
         self._classes = {}
@@ -350,6 +362,30 @@ class Unpickler:
         for obj, attr, proxy, method in self._proxies:
             method(obj, attr, proxy)
         self._proxies = []
+
+    def _resolve_weakrefs(self) -> None:
+        """Create weakrefs for targets that were not available yet.
+
+        Runs after the object graph has been restored but before proxies are
+        swapped into their parents, so that each placeholder proxy can be
+        replaced by a real weakref to the restored target.
+        """
+        if not self._weakref_proxies:
+            return
+        for proxy, idx in self._weakref_proxies:
+            try:
+                target = self._objs[idx]
+            except (IndexError, TypeError):
+                target = None
+            if isinstance(target, _Proxy):
+                target = target.get()
+            if target is None:
+                ref = _make_dead_weakref()
+            else:
+                ref = weakref.ref(target)
+            proxy.reset(ref)
+            self._swapref(proxy, ref)
+        self._weakref_proxies = []
 
     def _restore(
         self, obj: Any, _passthrough: Callable[[Any], Any] = _passthrough
@@ -382,6 +418,7 @@ class Unpickler:
             self.register_classes(classes)
         value = self._restore(obj)
         if reset:
+            self._resolve_weakrefs()
             self._swap_proxies()
         return value
 
@@ -556,6 +593,26 @@ class Unpickler:
             return _IDProxy(self._objs, idx)
         except TypeError:
             return None
+
+    def _restore_weakref(self, obj: dict[str, Any]) -> Any:
+        payload = obj[tags.WEAKREF]
+        if not has_tag(payload, tags.ID):
+            # The referent was already dead, or never made it into the
+            # snapshot through a strong reference.
+            return self._mkref(_make_dead_weakref())
+        idx = payload[tags.ID]
+        try:
+            target = self._objs[idx]
+        except (IndexError, TypeError):
+            target = None
+        if target is not None and not isinstance(target, _Proxy):
+            return self._mkref(weakref.ref(target))
+        # The target has not been restored yet; defer weakref creation
+        # until the whole graph has been restored.
+        proxy = _Proxy()
+        self._mkref(proxy)
+        self._weakref_proxies.append((proxy, idx))
+        return proxy
 
     def _restore_type(self, obj: dict[str, Any]) -> Any:
         typeref = util.loadclass(obj[tags.TYPE], classes=self._classes)
@@ -912,6 +969,8 @@ class Unpickler:
                 restore = self._restore_bytearray  # type: ignore[assignment]
             elif tags.ID in obj:
                 restore = self._restore_id
+            elif tags.WEAKREF in obj:
+                restore = self._restore_weakref
             elif tags.ITERATOR in obj:
                 restore = self._restore_iterator  # type: ignore[assignment]
             elif tags.OBJECT in obj:
