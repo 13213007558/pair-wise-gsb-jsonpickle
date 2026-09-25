@@ -33,6 +33,7 @@ def encode(
     include_properties: bool = False,
     handle_readonly: bool = False,
     handler_context: Any = None,
+    external_ref: Callable[[Any], Any | None] | None = None,
 ) -> str:
     """Return a JSON formatted representation of value, a Python object.
 
@@ -112,6 +113,14 @@ def encode(
         Pass custom context to a custom handler. This can be used to customize
         behavior at runtime based off data. Defaults to ``None``. An example can
         be found in the examples/ directory on GitHub.
+    :param external_ref:
+        Optional callback that maps an object to an external identifier.
+        When the callback returns a non-None identifier for an object, the
+        object is not expanded into the snapshot; a ``py/external`` reference
+        is emitted instead. Objects for which the callback returns ``None``
+        are encoded with the regular protocol. Decoding requires passing an
+        ``external_resolver`` to ``jsonpickle.decode``.
+
 
     >>> encode('my string') == '"my string"'
     True
@@ -136,9 +145,12 @@ def encode(
         handle_readonly=handle_readonly,
         original_object=value,
         handler_context=handler_context,
+        external_ref=external_ref,
     )
     if handler_context is not None:
         context.handler_context = handler_context
+    if external_ref is not None:
+        context.external_ref = external_ref
     return json.encode(
         context.flatten(value, reset=reset), indent=indent, separators=separators
     )
@@ -186,6 +198,7 @@ class Pickler:
         handle_readonly: bool = False,
         original_object: Any | None = None,
         handler_context: Any = None,
+        external_ref: Callable[[Any], Any | None] | None = None,
     ) -> None:
         self.unpicklable = unpicklable
         self.make_refs = make_refs
@@ -207,6 +220,9 @@ class Pickler:
         self.handle_readonly = handle_readonly
         # Custom context passed through to custom handlers, see #452
         self.handler_context = handler_context
+        # Optional callback returning an external identifier for objects
+        # that live outside the snapshot, see the py/external protocol.
+        self.external_ref = external_ref
 
         if self.use_base85:
             self._bytes_tag = tags.B85
@@ -383,6 +399,12 @@ class Pickler:
         max_reached = self._max_reached()
 
         try:
+            if self.external_ref is not None:
+                external_id = self.external_ref(obj)
+                if external_id is not None:
+                    # The object lives outside the snapshot; emit an external
+                    # reference instead of recursing into the object.
+                    return {tags.EXTERNAL: external_id}
             in_cycle = _in_cycle(obj, self._objs, max_reached, self.make_refs)
             flatten_func: Callable[[Any], str] | None
             if in_cycle:

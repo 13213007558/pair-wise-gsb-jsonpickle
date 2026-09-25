@@ -71,6 +71,12 @@ v5.0.0
       (#449) (+612)
     * Fix bug where compiled regex objects lost their flags (e.g. ``re.IGNORECASE``)
       when roundtripped through encode/decode. (+607)
+    * Add an external reference protocol (``py/external``). ``encode()`` accepts
+      an ``external_ref`` callback that maps selected objects to an external
+      identifier so they are not expanded into the snapshot, and ``decode()``
+      accepts an ``external_resolver`` callback (plus optional ``external_types``
+      declarations) that supplies the live objects. Each identifier is resolved
+      at most once per decode and all references to it share one instance.
     * Fix bug where encoding or decoding objects whose ``__reduce__`` or ``__reduce_ex__``
       methods had six elements (as permitted by pickle protocol 5) would raise an error. (#608)
       (+616)

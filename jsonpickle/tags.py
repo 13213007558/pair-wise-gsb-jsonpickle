@@ -24,6 +24,7 @@ OBJECT: str = "py/object"
 PROPERTY: str = "py/property"
 REDUCE: str = "py/reduce"
 DEFAULT_FACTORY: str = "py/default_factory"
+EXTERNAL: str = "py/external"
 REF: str = "py/ref"
 REPR: str = "py/repr"
 SEQ: str = "py/seq"
@@ -41,6 +42,7 @@ RESERVED: set[str] = {
     INITARGS,
     ITERATOR,
     MODULE,
+    EXTERNAL,
     NEWARGS,
     NEWARGSEX,
     NEWOBJ,
