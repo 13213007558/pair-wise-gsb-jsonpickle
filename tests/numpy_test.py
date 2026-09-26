@@ -1,4 +1,6 @@
+import contextlib
 import datetime
+import json
 import warnings
 
 import pytest
@@ -502,3 +504,273 @@ def test_no_external_references():
     del obj2
 
     assert state["count"] == 2
+
+
+# Out-of-band buffer mode: jsonpickle.ext.numpy.encode/decode
+
+
+@pytest.fixture
+def oob_handlers():
+    """Ensure a default ndarray handler is registered.
+
+    test_size_threshold_None leaves a size_threshold=None handler behind,
+    which forces text storage and would defeat the out-of-band tests.
+    """
+    jsonpickle.ext.numpy.register_handlers(ndarray_mode="warn")
+    yield
+    jsonpickle.ext.numpy.register_handlers(ndarray_mode="warn")
+
+
+def oob_roundtrip(obj, **kwargs):
+    text, buffers = jsonpickle.ext.numpy.encode(obj, **kwargs)
+    return jsonpickle.ext.numpy.decode(text, buffers), text, buffers
+
+
+@contextlib.contextmanager
+def ndarray_compression(compression):
+    """Temporarily register the ndarray view handler with a given compression"""
+    handlers.registry.unregister(np.ndarray)
+    handler = jsonpickle.ext.numpy.NumpyNDArrayHandlerView(
+        mode="warn", compression=compression
+    )
+    handlers.registry.register(np.ndarray, handler, base=True)
+    try:
+        yield
+    finally:
+        handlers.registry.unregister(np.ndarray)
+        jsonpickle.ext.numpy.register_handlers(ndarray_mode="warn")
+
+
+def tamper(text, mutate):
+    meta = json.loads(text)
+    mutate(meta)
+    return json.dumps(meta)
+
+
+def test_oob_encode_return_types(oob_handlers):
+    """Out-of-band encode returns (json metadata, ordered buffer table)"""
+    text, buffers = jsonpickle.ext.numpy.encode(np.arange(100))
+    assert isinstance(text, str)
+    assert isinstance(buffers, list)
+    assert len(buffers) == 1
+    assert all(isinstance(buf, bytes) for buf in buffers)
+    # the payload left the JSON document
+    assert "py/b64" not in text
+    # the default API is untouched and still returns a plain string
+    assert isinstance(jsonpickle.encode(np.arange(100)), str)
+
+
+def test_oob_small_arrays_use_text(oob_handlers):
+    """Arrays below the size threshold need no out-of-band buffer"""
+    decoded, text, buffers = oob_roundtrip(np.array([1, 2]))
+    assert buffers == []
+    npt.assert_array_equal(decoded, [1, 2])
+
+
+def test_oob_matches_default_mode(oob_handlers):
+    """Values restored in out-of-band mode match the default mode"""
+    arrays = [
+        np.random.rand(10, 20),
+        np.asfortranarray(np.arange(40).reshape(4, 10)),
+        np.array(["foo", "bar"] * 20),
+        np.array(["F" + str(i) for i in range(30)], dtype=object),
+        np.array([0, 1, -1, np.inf, -np.inf, np.nan], dtype="f2"),
+        np.arange(100).reshape(10, 10)[::2],
+    ]
+    for arr in arrays:
+        decoded, _, _ = oob_roundtrip(arr)
+        expected = roundtrip(arr)
+        npt.assert_array_equal(decoded, expected)
+        assert decoded.dtype == expected.dtype
+
+
+def test_oob_views_share_single_buffer(oob_handlers):
+    """Views of one allocation reference a single out-of-band buffer"""
+    rng = np.arange(200)
+    view = rng[100:]
+    text, buffers = jsonpickle.ext.numpy.encode([rng, view])
+    assert len(buffers) == 1
+
+    arr, vw = jsonpickle.ext.numpy.decode(text, buffers)
+    assert np.shares_memory(arr, vw)
+    arr[150] = -1
+    assert vw[50] == -1
+
+
+def test_oob_overlapping_views(oob_handlers):
+    """Writes through one restored view are visible in the overlapping one"""
+    base = np.arange(100)
+    v1 = base[20:80]
+    v2 = base[50:90]
+    text, buffers = jsonpickle.ext.numpy.encode([v1, v2])
+    assert len(buffers) == 1
+
+    r1, r2 = jsonpickle.ext.numpy.decode(text, buffers)
+    npt.assert_array_equal(r1, v1)
+    npt.assert_array_equal(r2, v2)
+    r1[30] = -1  # base index 50, the first element of v2
+    assert r2[0] == -1
+
+
+def test_oob_negative_strides(oob_handlers):
+    """Negative strides survive the out-of-band roundtrip"""
+    base = np.arange(100)
+    rev = base[::-1]
+    assert rev.strides[0] < 0
+    text, buffers = jsonpickle.ext.numpy.encode([base, rev])
+    assert len(buffers) == 1
+
+    r_base, r_rev = jsonpickle.ext.numpy.decode(text, buffers)
+    npt.assert_array_equal(r_rev, rev)
+    assert r_rev.strides[0] < 0
+    r_base[30] = -1
+    assert r_rev[69] == -1
+
+
+def test_oob_strided_view(oob_handlers):
+    """Non-standard strides and offsets work out-of-band"""
+    arr = np.eye(30)
+    view = arr[1:, 1:]
+    text, buffers = jsonpickle.ext.numpy.encode([arr, view])
+    assert len(buffers) == 1
+    new_arr, new_view = jsonpickle.ext.numpy.decode(text, buffers)
+    assert np.shares_memory(new_arr, new_view)
+    new_arr[10, 20] = -1
+    assert new_view[9, 19] == -1
+
+
+def test_oob_bytes_like_base_shared_once(oob_handlers):
+    """Views over a bytes-like base share one out-of-band buffer"""
+    dt = np.dtype([("x", "<i4"), ("y", "<f8")])
+    raw = bytearray(dt.itemsize * 4)
+    arr = np.frombuffer(raw, dtype=dt)
+    arr["x"] = [1, 2, 3, 4]
+    view = arr[1:3]
+
+    text, buffers = jsonpickle.ext.numpy.encode([arr, view])
+    # one underlying allocation, one buffer entry
+    assert len(buffers) == 1
+
+    r_arr, r_view = jsonpickle.ext.numpy.decode(text, buffers)
+    npt.assert_array_equal(r_arr, arr)
+    npt.assert_array_equal(r_view, view)
+    r_arr[1]["x"] = 99
+    assert r_view[0]["x"] == 99
+
+
+def test_oob_writeable_flag(oob_handlers):
+    arr = np.arange(100)
+    arr.flags.writeable = False
+    decoded, _, _ = oob_roundtrip(arr)
+    with pytest.raises(ValueError):
+        decoded[0] = 0
+
+
+def test_oob_byteorder(oob_handlers):
+    a = np.arange(100)
+    av = a.view(a.dtype.newbyteorder())
+    decoded, _, _ = oob_roundtrip(av)
+    npt.assert_array_equal(av, decoded)
+    assert decoded.dtype == av.dtype
+
+
+def test_oob_provided_buffer_types(oob_handlers):
+    """bytes, bytearray and memoryview are accepted as provided buffers"""
+    arr = np.arange(64, dtype=np.int64)
+    with ndarray_compression(None):
+        text, buffers = jsonpickle.ext.numpy.encode(arr)
+        (payload,) = buffers
+        assert payload == arr.tobytes()
+
+        # bytes is read-only: a private writable copy is made
+        decoded = jsonpickle.ext.numpy.decode(text, [payload])
+        decoded[0] = -1
+        assert payload == arr.tobytes()  # caller's buffer is untouched
+
+        # bytearray is writable: used in place (zero-copy)
+        backing = bytearray(payload)
+        decoded = jsonpickle.ext.numpy.decode(text, [backing])
+        decoded[0] = -1
+        assert np.frombuffer(backing, dtype=np.int64)[0] == -1
+
+        # contiguous memoryview
+        decoded = jsonpickle.ext.numpy.decode(text, [memoryview(bytearray(payload))])
+        npt.assert_array_equal(decoded, arr)
+
+        # multi-dimensional but contiguous memoryview
+        backing = bytearray(payload)
+        view2d = memoryview(backing).cast("B", [len(backing), 1])
+        decoded = jsonpickle.ext.numpy.decode(text, [view2d])
+        npt.assert_array_equal(decoded, arr)
+
+        # non-contiguous memoryview: explicitly copied via tobytes()
+        holder = np.zeros((len(payload), 2), dtype=np.uint8)
+        holder[:, 0] = np.frombuffer(payload, dtype=np.uint8)
+        noncontig = memoryview(holder[:, 0])
+        assert not noncontig.contiguous
+        decoded = jsonpickle.ext.numpy.decode(text, [noncontig])
+        npt.assert_array_equal(decoded, arr)
+
+        # anything else is rejected
+        with pytest.raises(TypeError, match="bytes-like"):
+            jsonpickle.ext.numpy.decode(text, ["not a buffer"])
+        with pytest.raises(TypeError, match="bytes-like"):
+            jsonpickle.ext.numpy.decode(text, [None])
+
+
+def test_oob_buffer_count_validation(oob_handlers):
+    """The buffer table is checked before anything is handed to NumPy"""
+    arr = np.arange(100, dtype=np.float64)
+    text, buffers = jsonpickle.ext.numpy.encode(arr)
+
+    # too few buffers
+    with pytest.raises(ValueError, match="out of range"):
+        jsonpickle.ext.numpy.decode(text, [])
+
+    # extra buffers are tolerated
+    decoded = jsonpickle.ext.numpy.decode(text, buffers + [b"extra"])
+    npt.assert_array_equal(decoded, arr)
+
+    # a tampered buffer index is rejected
+    def bump_index(meta):
+        meta["values"][jsonpickle.ext.numpy.BUFFER_TAG] = 7
+
+    with pytest.raises(ValueError, match="out of range"):
+        jsonpickle.ext.numpy.decode(tamper(text, bump_index), buffers)
+
+    # decoding out-of-band metadata without the buffer table fails loudly
+    with pytest.raises(ValueError, match="out-of-band"):
+        jsonpickle.decode(text)
+
+
+def test_oob_view_bounds_validation(oob_handlers):
+    """Out-of-bounds views are rejected instead of being handed to NumPy"""
+    base = np.arange(100)
+    view = base[10:20]
+    text, buffers = jsonpickle.ext.numpy.encode([base, view])
+
+    # offset beyond the end of the buffer
+    def bump_offset(meta):
+        meta[1]["offset"] = 10**9
+
+    with pytest.raises(ValueError, match="offset"):
+        jsonpickle.ext.numpy.decode(tamper(text, bump_offset), buffers)
+
+    # negative strides reaching below the start of the buffer;
+    # numpy itself only checks the upward reach, so this must be caught here
+    text, buffers = jsonpickle.ext.numpy.encode([base, base[::-1]])
+
+    def move_window(meta):
+        meta[1]["offset"] = 8  # stride -8 now reaches negative offsets
+
+    with pytest.raises(ValueError, match="byte range"):
+        jsonpickle.ext.numpy.decode(tamper(text, move_window), buffers)
+
+    # shape larger than the buffer
+    text, buffers = jsonpickle.ext.numpy.encode(base)
+
+    def grow_shape(meta):
+        meta["shape"] = [10**6]
+
+    with pytest.raises(ValueError, match="byte range"):
+        jsonpickle.ext.numpy.decode(tamper(text, grow_shape), buffers)

@@ -1,5 +1,14 @@
 v5.0.0
 ======
+    * The numpy extension now provides an explicit out-of-band buffer
+      mode via ``jsonpickle.ext.numpy.encode()`` and
+      ``jsonpickle.ext.numpy.decode()``. Encoding returns a
+      ``(json_text, buffers)`` tuple in which binary array payloads
+      are referenced by index instead of being embedded as base64 text,
+      and decoding restores them from the caller-provided buffer table.
+      Views sharing one allocation share a single buffer entry, and the
+      buffer count, lengths, and reachable byte ranges are validated
+      before anything is handed to NumPy.
     * **Breaking Change**: The ``yaml`` module is no longer registered by default.
       You can re-enable yaml support using ``jsonpickle.ext.yaml.register()``.
       (#550) (+551)

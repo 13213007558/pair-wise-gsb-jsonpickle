@@ -5,6 +5,7 @@ import json
 import sys
 import warnings
 import zlib
+from collections.abc import Iterable
 from types import ModuleType
 from typing import Any, NoReturn, Protocol, cast
 
@@ -12,9 +13,19 @@ import numpy as np
 import numpy.typing as npt
 
 from ..handlers import BaseHandler, register, unregister
+from ..pickler import Pickler
+from ..pickler import encode as _encode_json
+from ..unpickler import Unpickler
+from ..unpickler import decode as _decode_json
 from ..util import b64decode, b64encode, importable_name, loadclass
 
-__all__ = ["register_handlers", "unregister_handlers"]
+__all__ = [
+    "BUFFER_TAG",
+    "decode",
+    "encode",
+    "register_handlers",
+    "unregister_handlers",
+]
 
 
 # matches `np.ndarray`, `np.generic`, and anything else with a `.dtype` attribute
@@ -30,6 +41,188 @@ def get_byteorder(arr: _HasDType) -> str:
     """translate equals sign to native order"""
     byteorder = arr.dtype.byteorder
     return native_byteorder if byteorder == "=" else byteorder
+
+
+# Tag used in the JSON metadata to reference an out-of-band buffer by its
+# index in the buffer table returned by encode()
+BUFFER_TAG = "py/buffer"
+
+# Constructor options forwarded when encode()/decode() build their own
+# pickling context; anything else requires an explicit context= argument
+_PICKLER_OPTION_NAMES = (
+    "unpicklable",
+    "make_refs",
+    "keys",
+    "max_depth",
+    "warn",
+    "use_base85",
+    "fail_safe",
+    "include_properties",
+    "handle_readonly",
+    "handler_context",
+)
+_UNPICKLER_OPTION_NAMES = (
+    "keys",
+    "safe",
+    "on_missing",
+    "handle_readonly",
+    "handler_context",
+)
+
+
+def _oob_buffers(context: Any) -> list[bytes] | None:
+    """Return the out-of-band buffer table of a pickler context.
+
+    Returns None when the context is not encoding in out-of-band mode.
+    """
+    return getattr(context, "numpy_oob_buffers", None)
+
+
+def _stash_buffer(
+    context: Any, buf: bytes, key: tuple[int, int] | None = None
+) -> int:
+    """Append buf to the context's out-of-band buffer table.
+
+    When key (a memory (address, length) pair) is given, buffers are
+    deduplicated so that one underlying allocation appears exactly once,
+    no matter how many views reference it.
+    """
+    buffers: list[bytes] = context.numpy_oob_buffers
+    dedup: dict[tuple[int, int], int] | None = None
+    if key is not None:
+        dedup = context.__dict__.setdefault("_numpy_oob_dedup", {})
+        index = dedup.get(key)
+        if index is not None:
+            return index
+    index = len(buffers)
+    buffers.append(bytes(buf))
+    if dedup is not None:
+        assert key is not None
+        dedup[key] = index
+    return index
+
+
+def _buffer_index(value: Any) -> Any:
+    """Return the index if value is a buffer reference, else None"""
+    if isinstance(value, dict) and BUFFER_TAG in value:
+        return value[BUFFER_TAG]
+    return None
+
+
+def _normalize_provided_buffer(index: int, buffer: Any) -> npt.NDArray[Any]:
+    """Validate a caller-provided out-of-band buffer as a flat uint8 array.
+
+    bytes, bytearray and contiguous memoryview objects are accepted
+    directly. Non-contiguous memoryviews are explicitly copied via
+    memoryview.tobytes(); anything else is rejected with a TypeError.
+    """
+    if isinstance(buffer, memoryview) and not buffer.contiguous:
+        # explicit copy: a non-contiguous view cannot back an ndarray
+        buffer = buffer.tobytes()
+    try:
+        return np.frombuffer(buffer, dtype=np.uint8)
+    except (TypeError, ValueError, BufferError) as error:
+        raise TypeError(
+            f"out-of-band buffer {index} must be a contiguous bytes-like "
+            "object (bytes, bytearray, or contiguous memoryview), got "
+            f"{type(buffer).__name__}"
+        ) from error
+
+
+def _oob_array(
+    context: Any, index: Any, compression: ModuleType | None
+) -> npt.NDArray[Any]:
+    """Return the shared writable uint8 array for out-of-band buffer index.
+
+    The array is cached on the unpickler context, so every array restored
+    from the same buffer index shares one memory allocation. Writable
+    caller-provided buffers are used in place (zero-copy); read-only
+    buffers are copied exactly once so that restored arrays are writeable,
+    matching the default mode.
+    """
+    prepared = getattr(context, "numpy_oob_buffers", None)
+    if prepared is None:
+        raise ValueError(
+            f"snapshot references out-of-band buffer {index!r}; decode it "
+            "with jsonpickle.ext.numpy.decode() and supply the buffer table"
+        )
+    if (
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or not 0 <= index < len(prepared)
+    ):
+        raise ValueError(
+            f"out-of-band buffer index {index!r} is out of range; "
+            f"{len(prepared)} buffer(s) were provided"
+        )
+    cache = context.__dict__.setdefault("_numpy_oob_cache", {})
+    arr = cache.get(index)
+    if arr is None:
+        raw = prepared[index]
+        if compression is None:
+            arr = raw
+        else:
+            arr = np.frombuffer(compression.decompress(raw.data), dtype=np.uint8)
+        if not arr.flags.writeable:
+            arr = arr.copy()
+        cache[index] = arr
+    return arr
+
+
+def _buffer_nbytes(buffer: Any) -> int:
+    if isinstance(buffer, (np.ndarray, memoryview)):
+        return buffer.nbytes  # type: ignore[return-value]
+    return len(buffer)
+
+
+def _check_view_bounds(
+    nbytes: int,
+    offset: Any,
+    shape: tuple[int, ...],
+    strides: Any,
+    itemsize: int,
+) -> None:
+    """Ensure all bytes reachable through (offset, shape, strides) lie
+    inside a buffer of nbytes bytes.
+
+    NumPy does not validate the downward reach of negative strides, so an
+    out-of-bounds view must be rejected here rather than handed to
+    np.ndarray.
+    """
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError(f"array view offset {offset!r} is not a non-negative int")
+    if offset > nbytes:
+        raise ValueError(
+            f"array view offset {offset} exceeds buffer of {nbytes} bytes"
+        )
+    if strides is not None:
+        strides = tuple(strides)
+        if len(strides) != len(shape):
+            raise ValueError(
+                f"array view has {len(shape)} dimensions but "
+                f"{len(strides)} strides"
+            )
+    if 0 in shape:
+        return  # no bytes are reachable
+    low = high = offset
+    if strides is None:
+        span = itemsize
+        for dim in shape:
+            span *= dim
+        high = offset + span
+    else:
+        for dim, stride in zip(shape, strides):
+            step = (dim - 1) * stride
+            if step < 0:
+                low += step
+            else:
+                high += step
+        high += itemsize
+    if low < 0 or high > nbytes:
+        raise ValueError(
+            f"array view reaches byte range [{low}, {high}), outside the "
+            f"buffer of {nbytes} bytes"
+        )
 
 
 class NumpyBaseHandler(BaseHandler):
@@ -200,7 +393,12 @@ class NumpyNDArrayHandlerBinary(NumpyNDArrayHandler):
                 buf = obj.tostring(order="a")  # type: ignore[attr-defined]
             if self.compression:
                 buf = self.compression.compress(buf)
-            data["values"] = b64encode(buf)
+            buffers = _oob_buffers(self.context)
+            if buffers is None:
+                data["values"] = b64encode(buf)
+            else:
+                # out-of-band mode: reference the buffer table by index
+                data["values"] = {BUFFER_TAG: _stash_buffer(self.context, buf)}
             data["shape"] = obj.shape
             self.flatten_dtype(obj.dtype.newbyteorder("N"), data)
             self.flatten_byteorder(obj, data)
@@ -223,17 +421,33 @@ class NumpyNDArrayHandlerBinary(NumpyNDArrayHandler):
         else:
             # decode binary representation
             dtype = self.restore_dtype(data)
-            buf = b64decode(values)
-            if self.compression:
-                buf = self.compression.decompress(buf)
+            buffer_index = _buffer_index(values)
+            if buffer_index is not None:
+                # out-of-band mode: the payload lives in the
+                # caller-provided buffer table
+                buf = _oob_array(self.context, buffer_index, self.compression)
+            else:
+                buf = b64decode(values)
+                if self.compression:
+                    buf = self.compression.decompress(buf)
             # See note above about segfault bug for numpy dtype object. Those
             # are saved as a list to work around that.
             if dtype == object:
-                values = json.loads(buf.decode())
+                values = json.loads(bytes(buf).decode())
                 arr = np.array(values, dtype=dtype, order=data.get("order", "C"))
                 shape = data.get("shape", None)
                 if shape is not None:
                     arr = arr.reshape(shape)
+            elif buffer_index is not None:
+                shape = tuple(data.get("shape") or ())
+                _check_view_bounds(buf.nbytes, 0, shape, None, dtype.itemsize)
+                arr = np.ndarray(
+                    buffer=buf,
+                    dtype=dtype,
+                    shape=shape,
+                    order=data.get("order", "C"),
+                )
+                self.restore_byteorder(data, arr)
             else:
                 arr = np.ndarray(
                     buffer=buf,
@@ -369,7 +583,21 @@ class NumpyNDArrayHandlerView(NumpyNDArrayHandlerBinary):
                 else:
                     base_store = base_buf.tobytes()
 
-                data["base"] = self.context.flatten(base_store, reset=False)
+                buffers = _oob_buffers(self.context)
+                if buffers is None:
+                    data["base"] = self.context.flatten(base_store, reset=False)
+                else:
+                    # out-of-band mode: stash the buffer bytes and reference
+                    # them by index; deduplicate by allocation so that one
+                    # underlying buffer appears exactly once, no matter how
+                    # many views of it are serialized
+                    stored = bytes(base_store)
+                    if self.compression:
+                        stored = self.compression.compress(stored)
+                    key = (base_buf.ctypes.data, base_buf.nbytes)
+                    data["base"] = {
+                        BUFFER_TAG: _stash_buffer(self.context, stored, key=key)
+                    }
 
                 offset = obj.ctypes.data - base_buf.ctypes.data
                 if offset:
@@ -422,27 +650,45 @@ class NumpyNDArrayHandlerView(NumpyNDArrayHandlerBinary):
             arr = super().restore(data)
         else:
             # decode array view, which references the data of another array
-            base = self.context.restore(base, reset=False)
+            buffer_index = _buffer_index(base)
             buffer: Any
-            if isinstance(base, np.ndarray):
-                buffer = base.data
-            elif isinstance(base, (bytes, bytearray, memoryview)):
-                buffer = base
+            if buffer_index is not None:
+                # out-of-band mode: all views of one buffer index share
+                # a single allocation
+                base = None
+                buffer = _oob_array(self.context, buffer_index, self.compression)
             else:
-                # the object is probably a nested list
-                base = np.array(base)
-                buffer = base.data
-            if isinstance(base, np.ndarray):
-                assert base.flags.forc, (
-                    "Current implementation assumes base is C or F contiguous"
-                )
+                base = self.context.restore(base, reset=False)
+                if isinstance(base, np.ndarray):
+                    buffer = base.data
+                elif isinstance(base, (bytes, bytearray, memoryview)):
+                    buffer = base
+                else:
+                    # the object is probably a nested list
+                    base = np.array(base)
+                    buffer = base.data
+                if isinstance(base, np.ndarray):
+                    assert base.flags.forc, (
+                        "Current implementation assumes base is C or F contiguous"
+                    )
 
+            shape = data.get("shape")
+            offset = data.get("offset", 0)
+            strides = data.get("strides", None)
+            dtype = self.restore_dtype(data).newbyteorder(data.get("byteorder", "|"))
+            _check_view_bounds(
+                _buffer_nbytes(buffer),
+                offset,
+                tuple(shape) if shape is not None else (),
+                strides,
+                dtype.itemsize,
+            )
             arr = np.ndarray(
                 buffer=buffer,
-                dtype=self.restore_dtype(data).newbyteorder(data.get("byteorder", "|")),
-                shape=data.get("shape"),  # type: ignore[arg-type]
-                offset=data.get("offset", 0),
-                strides=data.get("strides", None),
+                dtype=dtype,
+                shape=shape,  # type: ignore[arg-type]
+                offset=offset,
+                strides=strides,
             )
 
             self.restore_flags(data, arr)
@@ -459,6 +705,61 @@ class NumpyUfuncHandler(BaseHandler):
         # it seems proper practice to make mypy happy that it can't return None here
         # is to use the cast
         return cast(np.ufunc, loadclass(obj["importable_name"]))
+
+
+def encode(value: Any, **kwargs: Any) -> tuple[str, list[bytes]]:
+    """Encode value to JSON with numpy array payloads out-of-band.
+
+    Returns a (json_text, buffers) tuple. json_text is the JSON metadata
+    in which every binary array payload is replaced by a
+    {"py/buffer": index} reference, and buffers is the ordered buffer
+    table those indexes refer to. Views of one underlying allocation
+    share a single buffer entry. Use decode() with the same buffer table
+    to restore the value.
+
+    Keyword arguments are forwarded to jsonpickle.encode(); pass a
+    pre-configured jsonpickle.Pickler as context= for full control over
+    pickler options. The plain jsonpickle.encode() is unaffected and
+    keeps embedding payloads as base64 text.
+    """
+    context = kwargs.get("context")
+    if context is None:
+        options = {k: kwargs[k] for k in _PICKLER_OPTION_NAMES if k in kwargs}
+        context = Pickler(**options)
+        kwargs["context"] = context
+    buffers: list[bytes] = []
+    context.numpy_oob_buffers = buffers
+    return _encode_json(value, **kwargs), buffers
+
+
+def decode(json_text: str, buffers: Iterable[Any], **kwargs: Any) -> Any:
+    """Restore a value encoded with encode().
+
+    buffers is the ordered buffer table returned by encode(). Each entry
+    must be bytes, bytearray or a contiguous memoryview; non-contiguous
+    memoryviews are explicitly copied via memoryview.tobytes(). Writable
+    buffers are used in place (zero-copy: arrays restored from them share
+    memory with the caller's buffer); read-only buffers are copied once
+    so that restored arrays are writeable, matching the default mode.
+
+    The buffer count, buffer lengths, and every byte range reachable
+    through the shape/strides/offset metadata are validated before
+    anything is handed to NumPy; out-of-bounds views raise ValueError.
+
+    Keyword arguments are forwarded to jsonpickle.decode(); pass a
+    pre-configured jsonpickle.Unpickler as context= for full control
+    over unpickler options.
+    """
+    context = kwargs.get("context")
+    if context is None:
+        options = {k: kwargs[k] for k in _UNPICKLER_OPTION_NAMES if k in kwargs}
+        context = Unpickler(**options)
+        kwargs["context"] = context
+    context.numpy_oob_buffers = [
+        _normalize_provided_buffer(index, buffer)
+        for index, buffer in enumerate(buffers)
+    ]
+    return _decode_json(json_text, **kwargs)
 
 
 def register_handlers(
