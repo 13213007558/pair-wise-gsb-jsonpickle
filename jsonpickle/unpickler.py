@@ -5,6 +5,7 @@
 # This software is licensed as described in the file COPYING, which
 # you should have received as part of this distribution.
 import dataclasses
+import weakref
 import warnings
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any, TypeAlias
@@ -176,6 +177,44 @@ class _IDProxy(_Proxy):
             return self._objs[self._index]
         except IndexError:
             return None
+
+
+class _WeakrefProxy(_Proxy):
+    """A proxy that materializes as a weakref once its referent exists.
+
+    Weakrefs cannot be retargeted after creation, so when the referent
+    is only available through a not-yet-resolved proxy (e.g. it appears
+    later in the snapshot or participates in a cycle) the weakref
+    creation is deferred until proxies are swapped.  The proxy only
+    holds the referent's own proxy, never the referent itself, so the
+    reference table does not gain any extra strong references.
+    """
+
+    def __init__(self, referent: _Proxy) -> None:
+        self._referent = referent
+
+    def get(self) -> Any:
+        return _make_weakref(self._referent.get())
+
+
+class _DeadRefTarget:
+    """A weakrefable throwaway object used to create already-dead weakrefs."""
+
+
+def _dead_weakref() -> weakref.ReferenceType:
+    """Return a weakref that is already dead."""
+    return weakref.ref(_DeadRefTarget())
+
+
+def _make_weakref(referent: Any) -> weakref.ReferenceType:
+    """Return a weakref to referent, or a dead weakref if not possible."""
+    if referent is None:
+        return _dead_weakref()
+    try:
+        return weakref.ref(referent)
+    except TypeError:
+        # The restored referent does not support weak references
+        return _dead_weakref()
 
 
 def _obj_setattr(obj: Any, attr: str, proxy: _Proxy) -> None:
@@ -383,6 +422,9 @@ class Unpickler:
         value = self._restore(obj)
         if reset:
             self._swap_proxies()
+            if isinstance(value, _WeakrefProxy):
+                # A top-level weakref whose referent had to be deferred
+                value = value.get()
         return value
 
     def register_classes(self, classes: ClassesType) -> None:
@@ -556,6 +598,19 @@ class Unpickler:
             return _IDProxy(self._objs, idx)
         except TypeError:
             return None
+
+    def _restore_weakref(self, obj: dict[str, Any]) -> Any:
+        referent = obj[tags.WEAKREF]
+        if referent is None:
+            # The weakref was already dead when pickled, or its referent
+            # was not strongly referenced anywhere in the snapshot.
+            return _dead_weakref()
+        referent = self._restore(referent)
+        if isinstance(referent, _Proxy):
+            # The referent has not been constructed yet; defer creating
+            # the weakref until proxies are swapped.
+            return _WeakrefProxy(referent)
+        return _make_weakref(referent)
 
     def _restore_type(self, obj: dict[str, Any]) -> Any:
         typeref = util.loadclass(obj[tags.TYPE], classes=self._classes)
@@ -912,6 +967,8 @@ class Unpickler:
                 restore = self._restore_bytearray  # type: ignore[assignment]
             elif tags.ID in obj:
                 restore = self._restore_id
+            elif tags.WEAKREF in obj:
+                restore = self._restore_weakref
             elif tags.ITERATOR in obj:
                 restore = self._restore_iterator  # type: ignore[assignment]
             elif tags.OBJECT in obj:

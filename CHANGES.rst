@@ -76,6 +76,13 @@ v5.0.0
       (+616)
     * Fix ``bytearray`` losing its contents through encode/decode; it now
       roundtrips like ``bytes``. (+606)
+    * Added round-trip support for ``weakref.ref`` objects. A live weakref
+      decodes to a weakref to the restored referent only when the referent is
+      also retained by a strong reference in the snapshot; weak edges never
+      pull objects into the snapshot by themselves, and weakrefs that were
+      already dead decode as dead weakrefs. Weakrefs with callbacks are
+      rejected with a ``ValueError`` rather than silently dropping the
+      callback.
     * Fix bug where ``datetime`` and ``time`` objects lost their PEP 495 ``fold``
       flag when roundtripped, which changed the instant a tz-aware datetime in a
       DST fall-back hour represented. Objects are now reduced at pickle protocol
