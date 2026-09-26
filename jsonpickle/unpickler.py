@@ -6,7 +6,7 @@
 # you should have received as part of this distribution.
 import dataclasses
 import warnings
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, TypeAlias
 
 from . import errors, handlers, tags, util
@@ -16,6 +16,10 @@ from .backend import json
 ClassesType: TypeAlias = type | dict[str, type] | Sequence[type] | None
 # handler for missing classes: either a policy name or a callback
 MissingHandler: TypeAlias = str | Callable[[str], Any]
+# resolver for external references: a mapping, a callable, or an object
+# with a resolve() method; an optional expected_type attribute declares
+# the type(s) that resolved objects must conform to
+ExternalResolver: TypeAlias = Mapping[str, Any] | Callable[[str], Any] | Any
 
 
 def decode(
@@ -29,6 +33,7 @@ def decode(
     on_missing: MissingHandler = "ignore",
     handle_readonly: bool = False,
     handler_context: Any = None,
+    external_resolver: "ExternalResolver | None" = None,
 ) -> Any:
     """Convert a JSON string into a Python object.
 
@@ -81,6 +86,19 @@ def decode(
         behavior at runtime based off data. Defaults to ``None``. An example can
         be found in the examples/ directory on GitHub.
 
+    :param external_resolver:
+        Resolver for ``py/external`` references produced when encoding with
+        the ``external_ref`` callback. It can be a mapping from identifier
+        to object, a callable taking the identifier, or an object with a
+        ``resolve(identifier)`` method. Each identifier is resolved at most
+        once per decode and every reference to it receives the same instance.
+        A resolver may declare an ``expected_type`` attribute (a type or
+        tuple of types); resolved objects that do not conform raise
+        ``jsonpickle.errors.ExternalReferenceTypeError``. Unknown
+        identifiers raise ``ExternalReferenceNotFoundError`` and resolver
+        failures raise ``ExternalResolverError``; decoding never falls back
+        to constructing objects by class name for external references.
+
     >>> decode('"my string"') == 'my string'
     True
     >>> decode('36')
@@ -101,9 +119,12 @@ def decode(
         on_missing=on_missing,
         handle_readonly=handle_readonly,
         handler_context=handler_context,
+        external_resolver=external_resolver,
     )
     if handler_context is not None:
         context.handler_context = handler_context
+    if external_resolver is not None:
+        context.external_resolver = external_resolver
     data = json.decode(string)
     result = context.restore(data, reset=reset, classes=classes)
     if is_ephemeral_context:
@@ -324,6 +345,7 @@ class Unpickler:
         on_missing: MissingHandler = "ignore",
         handle_readonly: bool = False,
         handler_context: Any = None,
+        external_resolver: "ExternalResolver | None" = None,
     ) -> None:
         self.backend = json
         self.keys = keys
@@ -332,6 +354,9 @@ class Unpickler:
         self.handle_readonly = handle_readonly
         # Custom context passed through to custom handlers, see #452
         self.handler_context = handler_context
+        # Resolver for py/external references, see the external
+        # reference protocol in jsonpickle.decode
+        self.external_resolver = external_resolver
 
         self.reset()
 
@@ -341,6 +366,8 @@ class Unpickler:
         self._obj_to_idx = {}
         self._objs = []
         self._proxies = []
+        # Cache of external identifiers resolved during this decode round
+        self._external_cache = {}
 
         # Extra local classes not accessible globally
         self._classes = {}
@@ -556,6 +583,55 @@ class Unpickler:
             return _IDProxy(self._objs, idx)
         except TypeError:
             return None
+
+    def _resolve_external(self, identifier: str) -> Any:
+        """Resolve an external identifier using the configured resolver"""
+        resolver = self.external_resolver
+        if resolver is None:
+            raise errors.ExternalResolverError(
+                f"cannot resolve external reference {identifier!r}: "
+                "no external_resolver was supplied to decode()"
+            )
+        try:
+            if isinstance(resolver, Mapping):
+                value = resolver[identifier]
+            elif hasattr(resolver, "resolve"):
+                value = resolver.resolve(identifier)
+            elif callable(resolver):
+                value = resolver(identifier)
+            else:
+                raise errors.ExternalResolverError(
+                    f"external_resolver {resolver!r} is neither a mapping, "
+                    "nor callable, nor does it provide a resolve() method"
+                )
+        except errors.ExternalReferenceError:
+            raise
+        except LookupError as error:
+            raise errors.ExternalReferenceNotFoundError(
+                f"external resolver could not find identifier {identifier!r}"
+            ) from error
+        except Exception as error:
+            raise errors.ExternalResolverError(
+                f"external resolver failed for identifier {identifier!r}: {error}"
+            ) from error
+        expected_type = getattr(resolver, "expected_type", None)
+        if expected_type is not None and not isinstance(value, expected_type):
+            raise errors.ExternalReferenceTypeError(
+                f"external reference {identifier!r} resolved to "
+                f"{type(value).__name__}, which does not conform to the "
+                f"declared expected_type {expected_type!r}"
+            )
+        return value
+
+    def _restore_external(self, obj: dict[str, Any]) -> Any:
+        identifier = obj[tags.EXTERNAL]
+        try:
+            return self._external_cache[identifier]
+        except KeyError:
+            pass
+        value = self._resolve_external(identifier)
+        self._external_cache[identifier] = value
+        return value
 
     def _restore_type(self, obj: dict[str, Any]) -> Any:
         typeref = util.loadclass(obj[tags.TYPE], classes=self._classes)
@@ -912,6 +988,8 @@ class Unpickler:
                 restore = self._restore_bytearray  # type: ignore[assignment]
             elif tags.ID in obj:
                 restore = self._restore_id
+            elif tags.EXTERNAL in obj:
+                restore = self._restore_external
             elif tags.ITERATOR in obj:
                 restore = self._restore_iterator  # type: ignore[assignment]
             elif tags.OBJECT in obj:

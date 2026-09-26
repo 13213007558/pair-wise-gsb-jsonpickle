@@ -1,3 +1,18 @@
+unreleased
+==========
+    * Added an external reference protocol. ``jsonpickle.encode()`` accepts an
+      ``external_ref`` callback that returns an external identifier for objects
+      that already live in an object repository; those objects are emitted as
+      ``py/external`` references instead of being expanded into the snapshot.
+      ``jsonpickle.decode()`` accepts an ``external_resolver`` (a mapping, a
+      callable, or an object with a ``resolve()`` method) that supplies the
+      matching objects. Each identifier is resolved at most once per decode and
+      all references receive the same instance. Unknown identifiers, resolver
+      failures, and mismatches against an optional ``expected_type``
+      declaration raise ``ExternalReferenceNotFoundError``,
+      ``ExternalResolverError``, and ``ExternalReferenceTypeError``
+      respectively from ``jsonpickle.errors``.
+
 v5.0.0
 ======
     * **Breaking Change**: The ``yaml`` module is no longer registered by default.

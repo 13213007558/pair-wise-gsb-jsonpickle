@@ -25,6 +25,7 @@ PROPERTY: str = "py/property"
 REDUCE: str = "py/reduce"
 DEFAULT_FACTORY: str = "py/default_factory"
 REF: str = "py/ref"
+EXTERNAL: str = "py/external"
 REPR: str = "py/repr"
 SEQ: str = "py/seq"
 SET: str = "py/set"
@@ -49,6 +50,7 @@ RESERVED: set[str] = {
     REDUCE,
     DEFAULT_FACTORY,
     REF,
+    EXTERNAL,
     REPR,
     SEQ,
     SET,
