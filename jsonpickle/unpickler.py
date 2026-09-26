@@ -332,6 +332,9 @@ class Unpickler:
         self.handle_readonly = handle_readonly
         # Custom context passed through to custom handlers, see #452
         self.handler_context = handler_context
+        # Caller-provided out-of-band buffers, used by
+        # jsonpickle.ext.numpy.decode_oob
+        self.numpy_oob_buffers: list[Any] | None = None
 
         self.reset()
 

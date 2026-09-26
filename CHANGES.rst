@@ -39,6 +39,15 @@ v5.0.0
       You should **never** encounter this error unless someone has manually modified the
       base64 that jsonpickle encoded to. (+631)
     * Mypy-compatible typing has been added to the entire jsonpickle public API! (#561) (+563) (+603)
+    * Added `jsonpickle.ext.numpy.encode_oob` and `decode_oob`, an explicit
+      out-of-band buffer mode for numpy arrays. Encoding returns a
+      `(json_metadata, buffers)` pair so large arrays no longer inflate the
+      JSON payload and memory footprint via base64; decoding takes the
+      caller-provided buffer table (bytes, bytearray, or memoryview;
+      non-contiguous memoryviews are copied into packed bytes) and validates
+      the buffer count plus every byte range reachable by a restored array or
+      view before handing anything to numpy. View sharing, dtypes, offsets
+      and strides are preserved exactly as in the default base64 mode.
     * Fixed bug with pickling subclasses of Exception with keyword-only args. (#564) (+565)
     * Removed jsonpickleJS from the tree. (#568) (+569)
     * Add support for the ``types`` module in ``util.importable_name`` (#574) (+575)

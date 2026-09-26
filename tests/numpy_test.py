@@ -1,5 +1,7 @@
 import datetime
+import json
 import warnings
+import zlib
 
 import pytest
 
@@ -502,3 +504,204 @@ def test_no_external_references():
     del obj2
 
     assert state["count"] == 2
+
+
+def oob_roundtrip(obj):
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob(obj)
+    return jsonpickle.ext.numpy.decode_oob(metadata, buffers)
+
+
+@pytest.fixture
+def default_ndarray_handler():
+    """Re-register the default ndarray handler.
+
+    test_size_threshold_None replaces the global ndarray handler with a
+    text-only one; the oob tests need the default binary configuration.
+    """
+    jsonpickle.ext.numpy.register_handlers()
+    yield
+
+
+def test_oob_roundtrip_matches_default_mode(default_ndarray_handler):
+    """Out-of-band buffers restore the same values as the base64 default"""
+    arr = np.random.rand(10, 10)
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob(arr)
+    assert isinstance(metadata, str)
+    assert len(buffers) == 1
+    assert all(isinstance(buf, bytes) for buf in buffers)
+    # the buffer holds exactly what the default mode would base64-encode
+    assert zlib.decompress(buffers[0]) == arr.tobytes(order="A")
+
+    actual = jsonpickle.ext.numpy.decode_oob(metadata, buffers)
+    npt.assert_array_equal(arr, actual)
+    npt.assert_array_equal(roundtrip(arr), actual)
+
+
+def test_oob_small_array_stays_inline(default_ndarray_handler):
+    """Arrays below the size threshold produce no buffer entries"""
+    arr = np.arange(3)
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob(arr)
+    assert buffers == []
+    npt.assert_array_equal(jsonpickle.ext.numpy.decode_oob(metadata, []), arr)
+
+
+def test_oob_shared_base_single_buffer(default_ndarray_handler):
+    """Views of one allocation share a single out-of-band buffer"""
+    rng = np.arange(20)
+    view = rng[10:]
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob([rng, view])
+    assert len(buffers) == 1
+
+    new_rng, new_view = jsonpickle.ext.numpy.decode_oob(metadata, buffers)
+    assert new_view.base is new_rng
+    new_rng[15] = -1
+    assert new_view[5] == -1
+
+
+def test_oob_overlapping_views(default_ndarray_handler):
+    """Mutations in the overlap of two views are visible from both sides"""
+    base = np.arange(100)
+    view1 = base[20:80]
+    view2 = base[40:100]
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob([view1, view2])
+    assert len(buffers) == 1
+
+    new_view1, new_view2 = jsonpickle.ext.numpy.decode_oob(metadata, buffers)
+    npt.assert_array_equal(new_view1, view1)
+    npt.assert_array_equal(new_view2, view2)
+    new_view1[30] = -1  # base[50], inside the overlap
+    assert new_view2[10] == -1
+
+
+def test_oob_strides_and_offset(default_ndarray_handler):
+    """Positive and negative strides plus offsets survive the roundtrip"""
+    base = np.arange(100)
+    shifted = base[30:]
+    reversed_view = base[::-1]
+    assert reversed_view.strides[0] < 0
+
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob([base, shifted, reversed_view])
+    assert len(buffers) == 1
+    new_base, new_shifted, new_reversed = jsonpickle.ext.numpy.decode_oob(
+        metadata, buffers
+    )
+
+    npt.assert_array_equal(new_shifted, shifted)
+    npt.assert_array_equal(new_reversed, reversed_view)
+    assert new_reversed.strides == reversed_view.strides
+    assert new_shifted.base is new_base
+    assert new_reversed.base is new_base
+    new_base[30] = -1
+    assert new_shifted[0] == -1
+    assert new_reversed[69] == -1
+
+
+def test_oob_dtype_object_roundtrip(default_ndarray_handler):
+    """Object arrays take the binary buffer path without segfaulting"""
+    arr = np.array([str(i) for i in range(30)], dtype=object)
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob(arr)
+    assert len(buffers) == 1
+    actual = jsonpickle.ext.numpy.decode_oob(metadata, buffers)
+    assert list(actual) == list(arr)
+
+
+def test_oob_buffer_count_mismatch(default_ndarray_handler):
+    """The provided buffer table must match the metadata"""
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob(np.arange(100))
+    with pytest.raises(ValueError):
+        jsonpickle.ext.numpy.decode_oob(metadata, [])
+    with pytest.raises(ValueError):
+        jsonpickle.ext.numpy.decode_oob(metadata, buffers + [b"extra"])
+
+
+def test_oob_rejects_regular_metadata(default_ndarray_handler):
+    """decode_oob refuses metadata that was not produced by encode_oob"""
+    with pytest.raises(ValueError):
+        jsonpickle.ext.numpy.decode_oob(jsonpickle.encode(np.arange(100)), [])
+
+
+def test_oob_metadata_rejected_by_default_decode(default_ndarray_handler):
+    """Regular decode() points oob metadata back at decode_oob"""
+    metadata, _buffers = jsonpickle.ext.numpy.encode_oob(np.arange(100))
+    with pytest.raises(ValueError):
+        jsonpickle.decode(metadata)
+
+
+def test_oob_truncated_buffer(default_ndarray_handler):
+    """A short buffer is rejected before numpy sees it"""
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob(np.arange(100))
+    buffers[0] = zlib.compress(zlib.decompress(buffers[0])[:-1])
+    with pytest.raises(ValueError):
+        jsonpickle.ext.numpy.decode_oob(metadata, buffers)
+
+
+def _find_first(node, key):
+    """Return the first dict in a decoded-json tree that contains key"""
+    if isinstance(node, dict):
+        if key in node:
+            return node
+        for value in node.values():
+            found = _find_first(value, key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_first(value, key)
+            if found is not None:
+                return found
+    return None
+
+
+def test_oob_out_of_bounds_view_rejected(default_ndarray_handler):
+    """A tampered view offset is rejected before numpy sees it"""
+    base = np.arange(100)
+    view = base[5:]
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob([base, view])
+
+    payload = json.loads(metadata)
+    _find_first(payload, "offset")["offset"] = 10**9
+    with pytest.raises(ValueError):
+        jsonpickle.ext.numpy.decode_oob(json.dumps(payload), buffers)
+
+
+def test_oob_out_of_range_buffer_index_rejected(default_ndarray_handler):
+    """A tampered buffer index is rejected"""
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob(np.arange(100))
+    payload = json.loads(metadata)
+    tag = jsonpickle.ext.numpy.OOB_BUFFER_TAG
+    _find_first(payload, tag)[tag] = 7
+    with pytest.raises(ValueError):
+        jsonpickle.ext.numpy.decode_oob(json.dumps(payload), buffers)
+
+
+def test_oob_buffer_types(default_ndarray_handler):
+    """Buffers may be bytes, bytearray or memoryview"""
+    arr = np.arange(100)
+    metadata, buffers = jsonpickle.ext.numpy.encode_oob(arr)
+    raw = buffers[0]
+
+    actual = jsonpickle.ext.numpy.decode_oob(metadata, [bytearray(raw)])
+    npt.assert_array_equal(arr, actual)
+
+    actual = jsonpickle.ext.numpy.decode_oob(metadata, [memoryview(raw)])
+    npt.assert_array_equal(arr, actual)
+
+    # a non-contiguous memoryview is explicitly copied into packed bytes
+    interleaved = bytearray()
+    for byte in raw:
+        interleaved += bytes([byte, 0])
+    strided_view = memoryview(interleaved)[::2]
+    assert not strided_view.c_contiguous
+    actual = jsonpickle.ext.numpy.decode_oob(metadata, [strided_view])
+    npt.assert_array_equal(arr, actual)
+
+    with pytest.raises(TypeError):
+        jsonpickle.ext.numpy.decode_oob(metadata, ["not a buffer"])
+
+
+def test_oob_default_api_unchanged(default_ndarray_handler):
+    """encode/decode keep their signatures and return types"""
+    arr = np.arange(100)
+    encoded = jsonpickle.encode(arr)
+    assert isinstance(encoded, str)
+    npt.assert_array_equal(jsonpickle.decode(encoded), arr)

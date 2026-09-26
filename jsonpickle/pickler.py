@@ -207,6 +207,10 @@ class Pickler:
         self.handle_readonly = handle_readonly
         # Custom context passed through to custom handlers, see #452
         self.handler_context = handler_context
+        # Out-of-band buffer table used by jsonpickle.ext.numpy.encode_oob;
+        # when not None, binary ndarray payloads are appended here instead of
+        # being inlined as base64
+        self.numpy_oob_buffers: list[Any] | None = None
 
         if self.use_base85:
             self._bytes_tag = tags.B85
