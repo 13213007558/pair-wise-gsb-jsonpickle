@@ -70,10 +70,18 @@ added to JSON::
 from .backend import JSONBackend, json  # noqa: F401
 from .handlers import register, unregister  # noqa: F401
 from .pickler import Pickler, encode  # noqa: F401
+from .inspector import (  # noqa: F401
+    Diagnostic,
+    InspectionError,
+    Node,
+    ObjectGraph,
+    inspect,
+    inspect_snapshot,
+)
 from .unpickler import Unpickler, decode  # noqa: F401
 from .version import __version__  # noqa: F401
 
-__all__ = ("encode", "decode")  # ruff: ignore[RUF022]
+__all__ = ("encode", "decode", "inspect")  # ruff: ignore[RUF022]
 
 # register built-in handlers
 __import__("jsonpickle.handlers", level=0)

@@ -29,6 +29,29 @@ jsonpickle API
 
 .. autofunction:: jsonpickle.decode
 
+Inspecting snapshots without execution
+--------------------------------------
+
+Use :func:`jsonpickle.inspect` (or ``decode(..., mode="inspect")``) when a
+debugger needs to examine object relationships without restoring the snapshot.
+Inspection does not import classes named by the payload, call constructors,
+evaluate ``py/repr`` or ``py/reduce`` data, or invoke custom restore handlers.
+It returns an :class:`jsonpickle.inspector.ObjectGraph` whose descriptive
+nodes retain class names, state, container contents, shared references, and
+cycles. Malformed references and unsupported legacy forms are reported as
+diagnostics instead of being guessed or executed.
+
+.. autofunction:: jsonpickle.inspect
+
+.. autoclass:: jsonpickle.inspector.ObjectGraph
+    :members:
+
+.. autoclass:: jsonpickle.inspector.Node
+    :members:
+
+.. autoclass:: jsonpickle.inspector.Diagnostic
+    :members:
+
 Choosing and Loading Backends
 -----------------------------
 

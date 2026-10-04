@@ -11,6 +11,7 @@ from typing import Any, TypeAlias
 
 from . import errors, handlers, tags, util
 from .backend import json
+from .inspector import inspect as inspect_snapshot
 
 # class names to class objects (or sequence of classes)
 ClassesType: TypeAlias = type | dict[str, type] | Sequence[type] | None
@@ -29,6 +30,7 @@ def decode(
     on_missing: MissingHandler = "ignore",
     handle_readonly: bool = False,
     handler_context: Any = None,
+    mode: str = "restore",
 ) -> Any:
     """Convert a JSON string into a Python object.
 
@@ -81,11 +83,21 @@ def decode(
         behavior at runtime based off data. Defaults to ``None``. An example can
         be found in the examples/ directory on GitHub.
 
+    :param mode: If set to ``"inspect"``, return a non-executing
+        :class:`jsonpickle.inspector.ObjectGraph` instead of restoring Python
+        objects. Inspect mode never imports snapshot classes, calls constructors,
+        evaluates reprs, reduces objects, or invokes custom handlers.
+
     >>> decode('"my string"') == 'my string'
     True
     >>> decode('36')
     36
     """
+
+    if mode == "inspect":
+        return inspect_snapshot(string, keys=keys)
+    if mode != "restore":
+        raise ValueError(f"unknown jsonpickle decode mode: {mode!r}")
 
     if isinstance(on_missing, str):
         on_missing = on_missing.lower()
